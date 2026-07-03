@@ -1,0 +1,369 @@
+# Plan: Shape Your Body - Unitree G1 Implementation
+
+## Context
+
+Reproduce the VGDS (Value-Gradient Design Search) method from "Shape Your Body" (Bohlinger & Peters, 2025) focused exclusively on the Unitree G1 humanoid. The goal is to train a general embodiment-aware policy (URMA architecture) across randomized G1 morphologies using PPO in MuJoCo MJX, then use the frozen value function's gradients to optimize the robot's physical design parameters (masses, link lengths, joint limits, PD gains, etc.) without retraining.
+
+Key idea: The URDF is NOT fixed during training. Each parallel environment samples a different G1 morphology variant at each episode reset. After training, the critic becomes a differentiable surrogate for design optimization.
+
+================================================================================
+
+## Phase 1: Project Setup & Dependencies
+
+### 1.1 Repository structure
+
+DARWINROBOTICS/
+├── README.md
+├── requirements.txt
+├── setup.py
+├── configs/
+│   ├── training.yaml              # PPO + URMA hyperparams
+│   ├── design_search.yaml         # VGDS hyperparams
+│   └── g1_design_space.yaml       # Design bounds for G1
+├── darwin/
+│   ├── __init__.py
+│   ├── envs/
+│   │   ├── __init__.py
+│   │   ├── g1_environment.py      # MJX locomotion env for G1
+│   │   ├── reward_functions.py    # Velocity-tracking rewards (Rudin-style)
+│   │   ├── control_functions.py   # PD controller (Rudin 2022)
+│   │   └── domain_randomization.py # Morphology randomization
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── urma_policy.py         # URMA actor network
+│   │   ├── urma_critic.py         # Direct-design URMA critic (with ensemble)
+│   │   └── design_map.py          # Phi(f) mapping: normalized -> physical params
+│   ├── training/
+│   │   ├── __init__.py
+│   │   ├── ppo_trainer.py         # PPO training loop (wraps RL-X PPO)
+│   │   └── curriculum.py          # Design-space curriculum expansion
+│   ├── design_search/
+│   │   ├── __init__.py
+│   │   ├── vgds.py                # Value-Gradient Design Search
+│   │   ├── state_bank.py          # Collect diverse states for search
+│   │   └── baselines.py           # CMA-ES, PSO, BO baselines (optional)
+│   └── utils/
+│       ├── __init__.py
+│       ├── urdf_utils.py          # URDF/MJCF parsing & modification
+│       └── visualization.py       # Design comparison visualization
+├── assets/
+│   └── g1/
+│       ├── g1_29dof.xml           # MuJoCo XML (converted from URDF)
+│       └── meshes/                # G1 mesh files
+├── scripts/
+│   ├── train.py                   # Training entry point
+│   ├── design_search.py           # VGDS entry point
+│   ├── evaluate.py                # Evaluate a design
+│   └── convert_urdf.py            # URDF -> MuJoCo XML converter
+└── experiments/
+    └── g1_results/                # Saved models, logs, optimized designs
+
+### 1.2 Dependencies
+- RL-X (nico-bohlinger/RL-X) - PPO implementation, MJX environments
+- MuJoCo + MJX (JAX-based GPU simulation)
+- JAX + Flax (neural networks, autodiff for value gradients)
+- mujoco Python bindings (URDF/XML manipulation)
+- optax (Adam optimizer for VGDS)
+- PyYAML (configs)
+- wandb / tensorboard (logging)
+
+### 1.3 Unitree G1 asset preparation
+- Source the G1 URDF from unitreerobotics/unitree_ros (g1_29dof variant, 29 DOF)
+- Convert URDF to MuJoCo XML using mujoco.load_model_from_path or convert_urdf.py
+- Validate joint names, link names, collision geometries, actuator definitions
+- G1 structure: 12 leg DOF + 3 waist DOF + 14 arm DOF = 29 DOF
+
+================================================================================
+
+## Phase 2: Design Space Definition (Phi mapping)
+
+### 2.1 Design parameters for G1 (d_design ~ 500-700 dims)
+Each parameter is normalized to f in [-1, 1]^d_design. The mapping Phi(f) converts to physical values.
+
+Per-joint parameters (29 joints x ~8 params = ~232 dims):
+- Joint position origin offsets (3D)
+- Joint range limits (2: lower, upper)
+- Armature
+- Damping
+- Stiffness
+
+Per-link parameters (30+ links x ~10 params = ~300 dims):
+- Body mass
+- Inertia (6 components: Ixx, Iyy, Izz, Ixy, Ixz, Iyz)
+- Center-of-mass position offset (3D)
+
+Per-actuator parameters (29 actuators x ~4 params = ~116 dims):
+- P gain (kp)
+- D gain (kd)
+- Force/torque limits
+- Action scale
+
+Geometry parameters (~50 dims):
+- Link geometry sizes (foot size, leg length scaling, etc.)
+- Collision geometry modifications
+
+### 2.2 Phi(f) implementation
+
+    # design_map.py
+    class DesignMap:
+        def __init__(self, base_xml_path, design_bounds):
+            # Parse base MuJoCo XML
+            # Define per-parameter: name, min, max, default
+
+        def __call__(self, f: jnp.array) -> MjModel:
+            # f in [-1, 1]^d_design
+            # Linear interpolation: param = (f+1)/2 * (max-min) + min
+            # Apply to MuJoCo model: masses, inertias, joint limits, gains, geometry
+            # Return modified model
+
+        def get_description_vectors(self, f) -> dict:
+            # Return per-joint description vectors d_j for URMA
+            # Includes: joint axis, position, limits, gains, mass, inertia, geometry
+
+### 2.3 Design bounds
+- Masses: +/-50% of nominal
+- Inertias: +/-50% of nominal
+- Joint limits: +/-30% of nominal
+- PD gains: +/-80% of nominal (large range, paper shows gains are impactful)
+- Geometry sizes: +/-40% of nominal
+- CoM offsets: +/-0.05m from nominal
+
+Hard bounds inside Phi to prevent: negative masses, zero inertias, overlapping geoms.
+
+================================================================================
+
+## Phase 3: URMA Architecture Implementation
+
+### 3.1 URMA Policy (actor)
+Based on [5, 6] - Unified Robot Morphology Architecture:
+
+Input:
+  - o_g: general observations (gravity, base vel, commands) -- fixed size
+  - {o_j}: per-joint observations (joint pos, vel, last action) -- variable per joint
+  - {d_j}: per-joint description vectors (axis, limits, gains, mass, geom) -- from Phi
+
+Architecture:
+  1. Per-joint encoder: g_psi(o_j) -> latent per joint
+  2. Per-joint attention key: g_phi(d_j) -> attention weight
+  3. Attention aggregation: z_joints = SUM alpha_j(d_j) * g_psi(o_j)
+     where alpha_j = softmax(g_phi(d_j) / tau)  (tau = learnable temperature)
+  4. Same for foot observations -> z_feet
+  5. Core network: MLP(concat(o_g, z_joints, z_feet)) -> latent
+  6. Per-joint decoder: latent -> action distribution per joint
+
+### 3.2 Direct-Design URMA Critic (KEY MODIFICATION from paper)
+The critic is modified to be MORE sensitive to design parameters:
+
+Differences from standard URMA critic:
+  - Encoder takes BOTH observations AND descriptions: g_psi(o_j, d_j)
+    (standard URMA: g_psi(o_j) only, d_j used only for attention keys)
+  - This makes embodiment info flow directly into attention values
+  - Result: stronger gradients through Phi for design optimization
+
+  - Ensemble of K=5 value heads on top of shared encoders
+  - Each head predicts V(s, Phi(f))
+  - Mean prediction: V_bar = (1/K) * SUM V_k
+  - Reduces catastrophic design updates from approximation errors
+
+### 3.3 Network dimensions (from paper/code)
+- Joint encoder hidden: [256, 128]
+- Attention key encoder: [128, 64]
+- Core network: [512, 256, 128]
+- Latent dimension L_d: 64
+- K = 5 critic heads
+
+================================================================================
+
+## Phase 4: Multi-Embodiment PPO Training
+
+### 4.1 Environment setup (g1_environment.py)
+- Simulator: MuJoCo MJX (JAX-compiled, GPU-parallel)
+- Parallel envs: 4096 environments (each with a different G1 variant)
+- Episode reset: Sample new f_i ~ U([-c_t, c_t]^d_design), apply Phi(f_i) to get a new G1 morphology
+- Curriculum: c_t starts small (0.3) and expands to 1.0 based on mean return
+
+### 4.2 Observation space
+
+General observations o_g (~20 dims):
+- Projected gravity vector (3)
+- Base angular velocity (3)
+- Commanded velocity (vx, vy, yaw_rate) (3)
+- Phase variables / clock signal (4-8)
+
+Per-joint observations o_j (~3 dims per joint):
+- Joint position (relative to default) (1)
+- Joint velocity (1)
+- Last action (1)
+
+Per-joint description d_j (~15-20 dims per joint):
+- Joint axis (3)
+- Joint position relative to parent (3)
+- Joint limits (2)
+- PD gains (2)
+- Adjacent body mass (1)
+- Adjacent body inertia (6)
+- Geometry size info (2-3)
+
+### 4.3 Action space
+- 29 target joint positions (one per actuator)
+- PD controller converts to torques: tau = kp * (a_target - q) - kd * q_dot
+
+### 4.4 Reward function (Rudin-style velocity tracking)
+
+    rewards = {
+        # Primary
+        "lin_vel_xy_tracking":  1.0 * exp(-||v_xy - v_cmd||^2 / 0.25),
+        "ang_vel_z_tracking":   0.5 * exp(-||w_z - w_cmd||^2 / 0.25),
+
+        # Regularization
+        "lin_vel_z":           -2.0 * v_z^2,
+        "ang_vel_xy":          -0.05 * ||w_xy||^2,
+        "torques":             -0.0001 * ||tau||^2,
+        "action_rate":         -0.01 * ||a_t - a_{t-1}||^2,
+        "joint_acc":           -2.5e-7 * ||q_ddot||^2,
+        "feet_air_time":        1.0 * (clamp contact-based air time reward),
+        "collision":           -1.0 * (self-collision penalty),
+        "orientation":         -5.0 * ||gravity_xy||^2,
+        "base_height":         -1.0 * (h - h_target)^2,
+    }
+
+### 4.5 PPO Hyperparameters (from RL-X / paper)
+- Learning rate: 3e-4 (with linear decay)
+- Discount gamma: 0.99
+- GAE lambda: 0.95
+- Clip ratio epsilon: 0.2
+- Entropy coef: 0.01
+- Value coef: 1.0
+- Mini-batches: 4
+- Epochs per update: 5
+- Max grad norm: 1.0
+- Episode length: 1000 steps (20s at 50Hz)
+- Total env steps: ~1e9 (7-9 hours on GPU)
+
+### 4.6 Training flow
+
+    for each PPO iteration:
+        1. For each of 4096 parallel envs:
+           - If episode reset: sample f_i ~ U([-c_t, c_t]^d), apply Phi(f_i)
+           - Step MJX with current morphology
+           - Collect (s, a, r, s', d_j) tuples
+        2. Compute GAE advantages
+        3. Update policy (actor) with clipped PPO objective
+        4. Update critic (all K heads) with value loss
+        5. Update curriculum c_t based on mean return
+
+================================================================================
+
+## Phase 5: Value-Gradient Design Search (VGDS)
+
+### 5.1 State bank collection
+After training, collect a diverse state bank S = {s_1, ..., s_M}:
+- Roll out the frozen policy on M=10000 random designs across full F
+- Store states from varied timesteps and morphologies
+- This provides diverse evaluation states for the critic
+
+### 5.2 VGDS objective
+
+    J_hat_lambda(f) = (1/|B|) * SUM_{s in B} V_bar(s, Phi(f)) - lambda * ||f - f_ref||^2 / d_design
+
+    where:
+      - V_bar = mean of K=5 critic heads
+      - f_ref = nominal G1 design (all zeros in normalized space)
+      - lambda = 100 (trust-region penalty)
+      - B = minibatch from state bank S
+      - d_design = dimensionality of design space
+
+### 5.3 VGDS optimization loop
+
+    def vgds(critic, design_map, f_init, f_ref, state_bank, config):
+        f = f_init  # starting design
+        optimizer = optax.adam(lr=0.01)
+
+        for n in range(N=500):  # optimization iterations
+            B = sample_minibatch(state_bank, size=256)
+
+            # Forward + backward through frozen critic and Phi
+            g_n = grad(J_hat_lambda)(f, B, critic, design_map, f_ref)
+
+            # Adam step with clipping
+            delta = optimizer.update(g_n)
+            delta = clip(delta, -delta_max, delta_max)  # delta_max = 0.05
+            f = clip(f + delta, -1, 1)  # stay in valid design space
+
+        return f  # optimized design
+
+### 5.4 Key JAX requirement
+The entire pipeline f -> Phi(f) -> d_j -> critic(s, d_j) -> V_bar must be JAX-differentiable.
+This means:
+- Phi(f) must be implemented in pure JAX (no Python loops over MuJoCo C API)
+- The critic receives d_j vectors (not MuJoCo model objects)
+- Gradients flow: nabla_f V_bar(s, Phi(f)) via JAX autodiff
+
+================================================================================
+
+## Phase 6: Evaluation & Analysis
+
+### 6.1 Metrics
+- Return improvement: Delta_R = R(f*) - R(f_init)
+- Velocity tracking error: RMSE of (v_xy - v_cmd)
+- Design change analysis: Group f* - f_ref by body part and parameter type
+
+### 6.2 Evaluation protocol
+1. Sample 10 random initial designs f_init from F
+2. Run VGDS from each f_init
+3. Evaluate each f* with 100 rollout episodes
+4. Compare against f_ref (nominal G1) and f_init
+5. Optionally compare against CMA-ES, PSO baselines
+
+### 6.3 Visualization
+- Before/after morphology rendering in MuJoCo viewer
+- Parameter change heatmap by body part
+- Training curves (return vs env steps)
+- Design search convergence plots
+
+================================================================================
+
+## Implementation Order
+
+Step | Task                                                          | Complexity
+-----|---------------------------------------------------------------|----------
+  1  | Setup repo, install RL-X + MJX + JAX deps                    | Low
+  2  | Prepare G1 MuJoCo XML asset (from URDF)                      | Low
+  3  | Define G1 design space & implement DesignMap (Phi)            | Medium
+  4  | Implement URMA policy network (actor)                         | High
+  5  | Implement Direct-Design URMA critic (ensemble)                | High
+  6  | Implement G1 MJX locomotion env with morphology randomization | High
+  7  | Implement reward function + PD controller                     | Medium
+  8  | Wire up PPO training loop (leverage RL-X)                     | Medium
+  9  | Implement curriculum for design space expansion               | Low
+ 10  | Train multi-embodiment policy (~1B steps)                     | Training
+ 11  | Implement state bank collection                               | Low
+ 12  | Implement VGDS optimizer                                      | Medium
+ 13  | Run design search on G1                                       | Search
+ 14  | Evaluation & analysis scripts                                 | Low
+
+================================================================================
+
+## Key Open-Source Components to Leverage
+
+Component            | Source                               | Usage
+---------------------|--------------------------------------|----------------------------------
+PPO algorithm        | RL-X (rl_x/algorithms/ppo/flax/)     | Core RL training
+MJX environment base | RL-X (rl_x/environments/mujoco/)     | Parallel GPU sim
+URMA architecture    | one_policy_to_run_them_all repo       | Policy/critic structure reference
+G1 URDF/meshes       | unitreerobotics/unitree_ros           | Robot model
+G1 MuJoCo XML        | unitreerobotics/unitree_mujoco        | Alternative source
+Optax (Adam)         | Google/DeepMind                       | VGDS optimizer
+MuJoCo Python        | DeepMind                              | XML manipulation, rendering
+
+================================================================================
+
+## Verification Plan
+
+1. Unit tests: DesignMap roundtrip (f -> Phi(f) -> verify physical params in valid range)
+2. Smoke test: Train PPO on fixed G1 (no randomization) for 1M steps -- should learn to stand/walk
+3. Randomization test: Train with c_t=0.1 for 10M steps -- returns should be positive across variants
+4. VGDS gradient test: Verify nabla_f V_bar is non-zero and finite for random f
+5. Full training: 1B steps multi-embodiment training (~7-9h on A100)
+6. Design search: Run VGDS from 10 random f_init, verify Delta_R > 0
+7. Comparison: Nominal G1 vs optimized G1 in velocity tracking task

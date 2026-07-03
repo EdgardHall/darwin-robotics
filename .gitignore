@@ -15,7 +15,11 @@ Thumbs.db
 # Dependencies
 node_modules/
 venv/
+.venv/
 __pycache__/
+
+# Experiments (checkpoints, logs, search outputs)
+experiments/g1_results/
 
 # Build
 build/

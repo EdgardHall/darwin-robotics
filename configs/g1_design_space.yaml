@@ -1,0 +1,46 @@
+# Design-space bounds for the Unitree G1 (29 DOF).
+#
+# Each entry defines how one normalized design coordinate f in [-1, 1] maps to
+# a physical parameter through Phi:
+#   mode: rel  ->  value = nominal * (1 + scale * f)        (multiplicative)
+#   mode: abs  ->  value = nominal + scale * f              (additive offset)
+# Hard clamps inside Phi prevent non-physical values (negative masses,
+# zero inertias, inverted joint limits).
+
+joint:
+  pos_offset:      {mode: abs, scale: 0.02}    # joint anchor offset [m], per axis
+  range:           {mode: rel, scale: 0.30}    # joint limit scaling (per endpoint)
+  armature:        {mode: rel, scale: 0.50, min: 1.0e-4}
+  damping:         {mode: rel, scale: 0.50, min: 1.0e-3}
+  stiffness:       {mode: abs, scale: 1.00, min: 0.0}      # nominal is 0 -> [0, 1] Nm/rad
+
+link:
+  mass:            {mode: rel, scale: 0.50, min: 1.0e-3}
+  inertia:         {mode: rel, scale: 0.50, min: 1.0e-7}   # diagonal components
+  com_offset:      {mode: abs, scale: 0.05}                # [m], per axis
+
+actuator:
+  kp:              {mode: rel, scale: 0.80, min: 1.0}
+  kd:              {mode: rel, scale: 0.80, min: 0.05}
+  torque_limit:    {mode: rel, scale: 0.50, min: 1.0}
+  action_scale:    {mode: rel, scale: 0.50, min: 0.05}
+
+geometry:
+  foot_size:       {mode: rel, scale: 0.40, min: 0.005}    # foot sphere radius scaling
+  foot_offset_x:   {mode: abs, scale: 0.03}                # foot sphere fore/aft shift [m]
+  thigh_length:    {mode: rel, scale: 0.15}                # knee body offset scaling
+  shank_length:    {mode: rel, scale: 0.15}                # ankle body offset scaling
+
+# Nominal PD gains and torque behaviour per joint name pattern (first match
+# wins). The XML uses pure torque motors, so these nominal gains define the
+# PD controller that the design space perturbs.
+nominal_gains:
+  - {pattern: hip,           kp: 100.0, kd: 2.5}
+  - {pattern: knee,          kp: 150.0, kd: 4.0}
+  - {pattern: ankle,         kp: 40.0,  kd: 2.0}
+  - {pattern: waist,         kp: 100.0, kd: 2.5}
+  - {pattern: shoulder,      kp: 40.0,  kd: 1.0}
+  - {pattern: elbow,         kp: 40.0,  kd: 1.0}
+  - {pattern: wrist,         kp: 20.0,  kd: 0.5}
+
+nominal_action_scale: 0.5

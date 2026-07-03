@@ -1,0 +1,67 @@
+# Multi-embodiment PPO training configuration (URMA on randomized G1 variants).
+
+env:
+  xml_path: assets/g1/scene_mjx.xml
+  num_envs: 4096
+  episode_length: 1000          # 20 s at 50 Hz
+  ctrl_dt: 0.02                 # 50 Hz control
+  sim_dt: 0.002                 # physics step (decimation = ctrl_dt / sim_dt)
+  base_init_height: 0.80
+  command_ranges:
+    lin_vel_x: [-1.0, 1.0]
+    lin_vel_y: [-0.5, 0.5]
+    ang_vel_yaw: [-1.0, 1.0]
+  termination:
+    base_height_min: 0.35
+    gravity_xy_max: 0.7         # |projected gravity xy| beyond this = fallen
+
+reward:
+  target_base_height: 0.75
+  tracking_sigma: 0.25
+  feet_air_time_target: 0.5
+  scales:
+    lin_vel_xy_tracking: 1.0
+    ang_vel_z_tracking: 0.5
+    lin_vel_z: -2.0
+    ang_vel_xy: -0.05
+    torques: -1.0e-4
+    action_rate: -0.01
+    joint_acc: -2.5e-7
+    feet_air_time: 1.0
+    orientation: -5.0
+    base_height: -1.0
+
+curriculum:
+  c_init: 0.3                   # initial half-width of the design sampling box
+  c_final: 1.0
+  c_step: 0.05
+  return_threshold: 10.0        # mean episode return required to expand
+  check_every_iters: 50
+
+ppo:
+  total_env_steps: 1.0e9
+  rollout_length: 32
+  learning_rate: 3.0e-4
+  anneal_lr: true
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_epsilon: 0.2
+  entropy_coef: 0.01
+  value_coef: 1.0
+  num_minibatches: 4
+  update_epochs: 5
+  max_grad_norm: 1.0
+
+network:
+  joint_encoder_hidden: [256, 128]
+  attention_key_hidden: [128, 64]
+  core_hidden: [512, 256, 128]
+  latent_dim: 64
+  num_critic_heads: 5
+  init_log_std: -0.7
+
+logging:
+  log_every_iters: 10
+  save_every_iters: 500
+  out_dir: experiments/g1_results
+seed: 0

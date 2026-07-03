@@ -1,0 +1,27 @@
+# Value-Gradient Design Search (VGDS) configuration.
+
+state_bank:
+  num_states: 10000             # M diverse states collected under the frozen policy
+  num_designs: 64               # morphologies rolled out to fill the bank
+  rollout_length: 200
+  design_range: 1.0             # sample f ~ U([-1, 1]^d) for bank collection
+
+vgds:
+  iterations: 500               # N optimization steps
+  batch_size: 256               # |B| states per step
+  learning_rate: 0.01           # Adam on f
+  trust_region_lambda: 100.0    # lambda * ||f - f_ref||^2 / d penalty
+  delta_max: 0.05               # per-step update clip
+  f_clip: 1.0                   # design space bound
+
+evaluation:
+  num_initial_designs: 10
+  num_eval_episodes: 100
+  num_eval_envs: 64
+
+baselines:
+  enabled: false
+  cma_es: {population: 32, sigma_init: 0.2, iterations: 100}
+  random_search: {samples: 2000}
+
+seed: 0
